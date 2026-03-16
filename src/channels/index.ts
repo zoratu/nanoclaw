@@ -9,4 +9,7 @@
 
 // telegram
 
+// twilio-sms (managed hosting: SQS inbound, Twilio REST outbound)
+import './twilio-sms.js';
+
 // whatsapp
