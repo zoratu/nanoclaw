@@ -49,6 +49,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 
 # Environment variables (overridden at runtime by ECS task)
 ENV NODE_ENV=production
+ENV MANAGED_MODE=true
 ENV ASSISTANT_NAME=Ace
 ENV STORE_DIR=/data/store
 ENV GROUPS_DIR=/data/groups

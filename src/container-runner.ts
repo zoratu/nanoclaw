@@ -21,6 +21,7 @@ import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
+  MANAGED_MODE,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
@@ -264,12 +265,104 @@ function buildContainerArgs(
   return args;
 }
 
+/**
+ * Managed mode: run claude CLI directly as a subprocess (no Docker).
+ * Used when deployed on ECS Fargate where Docker-in-Docker is unavailable.
+ * Fargate provides the tenant isolation that Docker would normally give.
+ */
+async function runManagedAgent(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+): Promise<ContainerOutput> {
+  const groupDir = resolveGroupFolderPath(group.folder);
+  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+
+  const agentName = `managed-${group.folder}-${Date.now()}`;
+
+  logger.info(
+    { group: group.name, mode: 'managed' },
+    'Running agent in managed mode (no container)',
+  );
+
+  return new Promise((resolve) => {
+    // Run claude CLI directly with the prompt
+    const proc = spawn('claude', [
+      '--print',
+      '--output-format', 'text',
+      '--max-turns', '25',
+      input.prompt,
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: groupDir,
+      env: {
+        ...process.env,
+        CLAUDE_CODE_DISABLE_NONESSENTIAL: '1',
+      },
+    });
+
+    onProcess(proc, agentName);
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on('close', async (code) => {
+      const result = stdout.trim();
+
+      if (code !== 0) {
+        logger.error(
+          { group: group.name, code, stderr: stderr.slice(0, 500) },
+          'Managed agent exited with error',
+        );
+        const output: ContainerOutput = {
+          status: 'error',
+          result: null,
+          error: stderr.slice(0, 500) || `Exit code ${code}`,
+        };
+        if (onOutput) await onOutput(output);
+        resolve(output);
+        return;
+      }
+
+      if (result) {
+        const output: ContainerOutput = {
+          status: 'success',
+          result,
+        };
+        if (onOutput) await onOutput(output);
+        resolve(output);
+      } else {
+        resolve({ status: 'success', result: null });
+      }
+    });
+
+    // Timeout
+    setTimeout(() => {
+      logger.warn({ group: group.name }, 'Managed agent timed out');
+      proc.kill('SIGTERM');
+    }, CONTAINER_TIMEOUT);
+  });
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  if (MANAGED_MODE) {
+    return runManagedAgent(group, input, onProcess, onOutput);
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
