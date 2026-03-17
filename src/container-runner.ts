@@ -266,91 +266,94 @@ function buildContainerArgs(
 }
 
 /**
- * Managed mode: run claude CLI directly as a subprocess (no Docker).
+ * Managed mode: call Anthropic API directly (no Docker, no CLI).
  * Used when deployed on ECS Fargate where Docker-in-Docker is unavailable.
  * Fargate provides the tenant isolation that Docker would normally give.
  */
 async function runManagedAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, containerName: string) => void,
+  _onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
-  const agentName = `managed-${group.folder}-${Date.now()}`;
-
   logger.info(
     { group: group.name, mode: 'managed' },
-    'Running agent in managed mode (no container)',
+    'Running agent in managed mode (direct API call)',
   );
 
-  return new Promise((resolve) => {
-    // Run claude CLI directly with the prompt
-    const proc = spawn('claude', [
-      '--print',
-      '--output-format', 'text',
-      '--max-turns', '25',
-      input.prompt,
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: groupDir,
-      env: {
-        ...process.env,
-        CLAUDE_CODE_DISABLE_NONESSENTIAL: '1',
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    const output: ContainerOutput = {
+      status: 'error',
+      result: null,
+      error: 'ANTHROPIC_API_KEY not set',
+    };
+    if (onOutput) await onOutput(output);
+    return output;
+  }
+
+  // Read group CLAUDE.md for system prompt if it exists
+  let systemPrompt = `You are Ace, an AI assistant for construction professionals. You help with email management, document updates, task organization, scheduling, and answering work-related questions. Keep responses concise and practical — your users are busy people on job sites. Respond via SMS so keep messages short.`;
+  const claudeMdPath = path.join(groupDir, 'CLAUDE.md');
+  if (fs.existsSync(claudeMdPath)) {
+    systemPrompt += '\n\n' + fs.readFileSync(claudeMdPath, 'utf-8');
+  }
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
       },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: input.prompt }],
+      }),
     });
 
-    onProcess(proc, agentName);
+    if (!res.ok) {
+      const errText = await res.text();
+      logger.error({ status: res.status, error: errText }, 'Anthropic API error');
+      const output: ContainerOutput = {
+        status: 'error',
+        result: null,
+        error: `API error ${res.status}: ${errText.slice(0, 200)}`,
+      };
+      if (onOutput) await onOutput(output);
+      return output;
+    }
 
-    let stdout = '';
-    let stderr = '';
+    const data = await res.json() as { content: Array<{ type: string; text?: string }> };
+    const text = data.content
+      .filter((c) => c.type === 'text')
+      .map((c) => c.text)
+      .join('');
 
-    proc.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
+    logger.info({ group: group.name, responseLength: text.length }, 'Agent response received');
 
-    proc.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    proc.on('close', async (code) => {
-      const result = stdout.trim();
-
-      if (code !== 0) {
-        logger.error(
-          { group: group.name, code, stderr: stderr.slice(0, 500) },
-          'Managed agent exited with error',
-        );
-        const output: ContainerOutput = {
-          status: 'error',
-          result: null,
-          error: stderr.slice(0, 500) || `Exit code ${code}`,
-        };
-        if (onOutput) await onOutput(output);
-        resolve(output);
-        return;
-      }
-
-      if (result) {
-        const output: ContainerOutput = {
-          status: 'success',
-          result,
-        };
-        if (onOutput) await onOutput(output);
-        resolve(output);
-      } else {
-        resolve({ status: 'success', result: null });
-      }
-    });
-
-    // Timeout
-    setTimeout(() => {
-      logger.warn({ group: group.name }, 'Managed agent timed out');
-      proc.kill('SIGTERM');
-    }, CONTAINER_TIMEOUT);
-  });
+    const output: ContainerOutput = {
+      status: 'success',
+      result: text,
+    };
+    if (onOutput) await onOutput(output);
+    return output;
+  } catch (err: any) {
+    logger.error({ group: group.name, err: err.message }, 'Managed agent error');
+    const output: ContainerOutput = {
+      status: 'error',
+      result: null,
+      error: err.message,
+    };
+    if (onOutput) await onOutput(output);
+    return output;
+  }
 }
 
 export async function runContainerAgent(
