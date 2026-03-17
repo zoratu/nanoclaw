@@ -357,6 +357,8 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
+      // Reload registered groups from DB to pick up auto-registrations (e.g. new SMS senders)
+      registeredGroups = getAllRegisteredGroups();
       const jids = Object.keys(registeredGroups);
       const { messages, newTimestamp } = getNewMessages(
         jids,
