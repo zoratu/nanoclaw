@@ -5,9 +5,12 @@
  * Outbound: sends SMS via Twilio REST API.
  */
 
-import { Channel, NewMessage, OnInboundMessage, OnChatMetadata } from '../types.js';
+import { Channel, NewMessage, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import { logger } from '../logger.js';
+import { setRegisteredGroup } from '../db.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
+import fs from 'fs';
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
@@ -32,10 +35,41 @@ class TwilioSmsChannel implements Channel {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private onMessage: OnInboundMessage;
   private onChatMetadata: OnChatMetadata;
+  private registeredGroups: () => Record<string, RegisteredGroup>;
+  private autoRegistered = new Set<string>();
 
   constructor(opts: ChannelOpts) {
     this.onMessage = opts.onMessage;
     this.onChatMetadata = opts.onChatMetadata;
+    this.registeredGroups = opts.registeredGroups;
+  }
+
+  /** Auto-register a new SMS sender as a solo chat group so NanoClaw processes their messages. */
+  private ensureGroupRegistered(chatJid: string, senderName: string): void {
+    const groups = this.registeredGroups();
+    if (groups[chatJid] || this.autoRegistered.has(chatJid)) return;
+
+    const folderName = chatJid.replace(/[^a-zA-Z0-9]/g, '-');
+    const group: RegisteredGroup = {
+      name: senderName,
+      folder: folderName,
+      trigger: '',
+      added_at: new Date().toISOString(),
+      requiresTrigger: false, // SMS solo chats don't need @Ace trigger
+      isMain: false,
+    };
+
+    // Create group folder
+    try {
+      const groupDir = resolveGroupFolderPath(folderName);
+      fs.mkdirSync(groupDir + '/logs', { recursive: true });
+    } catch (err) {
+      logger.warn({ chatJid, err }, 'Failed to create group folder');
+    }
+
+    setRegisteredGroup(chatJid, group);
+    this.autoRegistered.add(chatJid);
+    logger.info({ chatJid, name: senderName }, 'Auto-registered SMS sender as group');
   }
 
   async connect(): Promise<void> {
@@ -119,6 +153,9 @@ class TwilioSmsChannel implements Channel {
           const parsed: SqsMessage = JSON.parse(sqsMsg.Body || '{}');
           const chatJid = `sms:${parsed.from}`;
           const now = parsed.timestamp || new Date().toISOString();
+
+          // Auto-register sender as a group so NanoClaw processes their messages
+          this.ensureGroupRegistered(chatJid, parsed.fromName || parsed.from);
 
           // Notify about chat metadata
           this.onChatMetadata(chatJid, now, parsed.fromName || parsed.from, 'twilio-sms', false);
