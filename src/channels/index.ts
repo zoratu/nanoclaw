@@ -9,6 +9,9 @@
 
 // telegram
 
+// sinch (managed hosting: SQS inbound, Sinch Conversation API outbound)
+import './sinch.js';
+
 // twilio-sms (managed hosting: SQS inbound, Twilio REST outbound)
 import './twilio-sms.js';
 
